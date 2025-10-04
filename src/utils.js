@@ -69,18 +69,24 @@ export function iou(a, b) {
  * @param {Array<{x1:number,y1:number,x2:number,y2:number,score:number,cls:number}>} dets
  * @param {number} iouThresh
  */
-export function nonMaxSuppression(dets, iouThresh) {
-  const sorted = dets.slice().sort((a, b) => b.score - a.score);
+export function nonMaxSuppression(detections, iouThreshold = 0.45, maxDet = 100) {
+  if (!detections || detections.length === 0) return [];
+
+  // Sort by score descending
+  detections.sort((a, b) => b.score - a.score);
+
   const keep = [];
-  while (sorted.length) {
-    const cur = sorted.shift();
-    keep.push(cur);
-    for (let i = sorted.length - 1; i >= 0; i--) {
-      if (iou(cur, sorted[i]) > iouThresh && sorted[i].cls === cur.cls) {
-        sorted.splice(i, 1);
-      }
-    }
+
+  while (detections.length > 0 && keep.length < maxDet) {
+    const best = detections.shift(); // highest score
+    keep.push(best);
+
+    detections = detections.filter(det => {
+      if (det.clsId !== best.clsId) return true; // class-agnostic? remove this line
+      return iou(best, det) < iouThreshold;
+    });
   }
+
   return keep;
 }
 
@@ -212,4 +218,104 @@ export function drawDetectionsOnSource(dets, source, map, canvas, opts = {}) {
     ctx.fillStyle = "#FFFFFF";
     ctx.fillText(label, tx + 4, ty - 6);
   });
+}
+
+
+const MASK_THRESHOLD = 0.5; // tweak if needed
+const PALETTE = [
+  [255, 0, 0, 100],
+  [0, 255, 0, 100],
+  [0, 0, 255, 100],
+  [255, 255, 0, 100],
+  [255, 0, 255, 100],
+  [0, 255, 255, 100],
+];
+
+/**
+ * Draw YOLOv8-seg masks cropped to each detection bbox and mapped back to source size.
+ *
+ * @param {Array} dets  - kept detections [{x,y,w,h,clsId,score,maskCoeffs}, ...] in MODEL INPUT coords (letterboxed 0..inputSize)
+ * @param {Array} masks - [{mask: Float32Array, width: pW, height: pH}, ...] raw proto-space masks (0..1) per det
+ * @param {Object} lb   - letterbox info from your preprocess: expects lb.canvas, and (ratio, dw, dh) if available
+ * @param {HTMLImageElement|HTMLVideoElement|HTMLCanvasElement} src - original source (image/video)
+ * @param {HTMLCanvasElement} targetCanvas - where to paint
+ */
+export function drawYoloSegMasksCropped(dets, masks, lb, src, targetCanvas) {
+  const ctx = targetCanvas.getContext("2d");
+  const srcW = src.naturalWidth || src.videoWidth || src.width;
+  const srcH = src.naturalHeight || src.videoHeight || src.height;
+
+  // ensure output canvas matches source pixels
+  if (targetCanvas.width !== srcW || targetCanvas.height !== srcH) {
+    targetCanvas.width = srcW;
+    targetCanvas.height = srcH;
+  }
+
+  // Draw the source frame first
+  ctx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+  ctx.drawImage(src, 0, 0, srcW, srcH);
+
+  // Model input (letterboxed) size
+  const inputW = lb?.canvas?.width || 640;
+  const inputH = lb?.canvas?.height || 640;
+
+  // Undo-letterbox params (fallbacks if lb didn’t expose them)
+  const ratio =
+    lb?.ratio ??
+    Math.min(inputW / srcW, inputH / srcH);
+  const newUnpaddedW = Math.round(srcW * ratio);
+  const newUnpaddedH = Math.round(srcH * ratio);
+  const dw = lb?.dw ?? (inputW - newUnpaddedW) / 2;
+  const dh = lb?.dh ?? (inputH - newUnpaddedH) / 2;
+
+  for (let k = 0; k < dets.length; k++) {
+    const det = dets[k];
+    const { mask, width: pW, height: pH } = masks[k];
+
+    // Build a proto-space RGBA image once per det (transparent outside mask)
+    const rgba = new Uint8ClampedArray(pW * pH * 4);
+    const [r, g, b, a] = PALETTE[det.clsId % PALETTE.length];
+
+    for (let i = 0; i < pW * pH; i++) {
+      const m = mask[i]; // 0..1
+      const alpha = m > MASK_THRESHOLD ? a : 0;
+      const j = i * 4;
+      rgba[j + 0] = r;
+      rgba[j + 1] = g;
+      rgba[j + 2] = b;
+      rgba[j + 3] = alpha;
+    }
+
+    const protoCanvas = document.createElement("canvas");
+    protoCanvas.width = pW;
+    protoCanvas.height = pH;
+    const pctx = protoCanvas.getContext("2d");
+    pctx.putImageData(new ImageData(rgba, pW, pH), 0, 0);
+
+    // Box in model-input coords
+    const x1 = det.x - det.w / 2;
+    const y1 = det.y - det.h / 2;
+    const w = det.w;
+    const h = det.h;
+
+    // Crop window in proto-space (160x160 typically)
+    const sx = Math.max(0, Math.floor((x1 / inputW) * pW));
+    const sy = Math.max(0, Math.floor((y1 / inputH) * pH));
+    const sw = Math.max(1, Math.min(pW - sx, Math.ceil((w / inputW) * pW)));
+    const sh = Math.max(1, Math.min(pH - sy, Math.ceil((h / inputH) * pH)));
+
+    // Destination rect in ORIGINAL image pixels (undo letterbox)
+    const dx = Math.round((x1 - dw) / ratio);
+    const dy = Math.round((y1 - dh) / ratio);
+    const dwPx = Math.round(w / ratio);
+    const dhPx = Math.round(h / ratio);
+
+    // Draw cropped & scaled mask into the box area only
+    ctx.drawImage(protoCanvas, sx, sy, sw, sh, dx, dy, dwPx, dhPx);
+
+    // Optional: outline box
+    ctx.strokeStyle = `rgba(${r},${g},${b},0.9)`;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(dx, dy, dwPx, dhPx);
+  }
 }
